@@ -1,9 +1,12 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Depends, Header
+from typing import Dict, Optional, List
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.csrf import csrf_manager
+from src.common.embedded_sessions import create_embedded_session, configure_embedded_sessions
+from src.common.service_accounts import service_account_registry, ServiceAccountStatus
 
 router = APIRouter()
 registry = AgentRegistry()
@@ -54,140 +57,201 @@ async def stop_agent(agent_id: str):
 async def agent_count():
     return {"count": registry.count()}
 
-# 2019-03-18T11:10:18 update
 
-# 2019-04-22T13:58:05 update
-
-# 2019-05-28T08:52:40 update
-
-# 2019-06-13T19:27:11 update
-
-# 2019-06-25T18:52:04 update
-
-# 2019-06-26T17:23:40 update
-
-# 2019-07-24T12:38:12 update
-
-# 2019-08-06T17:13:22 update
-
-# 2019-09-26T19:27:40 update
-
-# 2019-11-08T15:48:07 update
-
-# 2019-12-05T16:07:01 update
-
-# 2020-01-17T17:50:06 update
-
-# 2020-04-24T17:12:53 update
-
-# 2020-07-21T19:32:14 update
-
-# 2020-07-21T20:23:54 update
-
-# 2020-08-14T20:37:18 update
-
-# 2020-11-05T16:47:32 update
-
-# 2021-03-11T12:52:51 update
-
-# 2021-03-15T12:40:28 update
-
-# 2021-03-19T19:24:45 update
-
-# 2021-05-07T14:43:25 update
-
-# 2021-05-12T12:11:05 update
-
-# 2021-05-26T19:45:39 update
-
-# 2021-06-29T19:14:28 update
-
-# 2021-07-09T17:57:49 update
-
-# 2021-07-19T08:20:34 update
-
-# 2021-07-23T15:35:00 update
-
-# 2021-07-26T09:55:35 update
-
-# 2021-11-01T20:50:23 update
-
-# 2022-02-04T09:23:08 update
-
-# 2022-02-14T15:58:17 update
-
-# 2022-02-28T09:52:05 update
-
-# 2022-05-19T16:28:06 update
-
-# 2022-05-30T15:01:44 update
-
-# 2022-07-31T11:24:57 update
-
-# 2022-08-09T15:47:57 update
-
-# 2022-08-19T12:51:59 update
-
-# 2022-11-02T08:06:45 update
-
-# 2022-11-21T14:12:56 update
-
-# 2023-01-13T12:25:51 update
-
-# 2023-03-31T14:11:34 update
-
-# 2023-04-03T20:57:22 update
-
-# 2023-04-28T19:01:38 update
-
-# 2023-07-18T16:47:22 update
-
-# 2023-09-28T18:50:58 update
-
-# 2023-10-02T13:22:15 update
-
-# 2023-10-23T10:46:19 update
-
-# 2023-11-02T16:52:55 update
-
-# 2023-12-08T17:38:20 update
-
-# 2023-12-11T10:59:19 update
-
-# 2024-01-15T16:27:41 update
-
-# 2024-02-09T11:56:21 update
-
-# 2024-02-15T16:47:43 update
-
-# 2024-03-26T08:08:33 update
-
-# 2024-07-11T15:59:46 update
-
-# 2024-09-04T17:13:05 update
-
-# 2024-09-20T11:28:38 update
-
-# 2024-12-02T16:42:53 update
-
-# 2025-01-15T12:12:38 update
-
-# 2025-02-05T09:08:36 update
-
-# 2025-05-16T19:40:31 update
-
-# 2025-06-13T13:20:50 update
-
-# 2025-08-13T12:22:26 update
-
-# 2025-09-01T12:30:44 update
-
-# 2025-11-06T12:23:44 update
-
-# 2025-12-26T08:40:45 update
-
-# 2026-04-08T19:23:48 update
-
-# 2026-04-09T20:30:37 update
-
-# 2026-05-13T11:36:25 update
+@router.post("/org/switch")
+async def switch_organization(
+    target_org_id: str,
+    x_csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    authorization: str = Header(..., alias="Authorization"),
+):
+    """Switch active organization context.
+
+    Requires a CSRF token bound to the session and target organization.
+    The token is single-use and expires after 5 minutes.
+    """
+    # Extract session identifier from Bearer token
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    session_id = authorization[7:]  # Strip "Bearer " prefix
+
+    # Validate CSRF token
+    is_valid, error = csrf_manager.validate(x_csrf_token, session_id, target_org_id)
+    if not is_valid:
+        raise HTTPException(status_code=403, detail=error)
+
+    return {
+        "status": "switched",
+        "active_organization": target_org_id,
+    }
+
+
+@router.get("/org/csrf-token")
+async def get_csrf_token(
+    target_org_id: str,
+    authorization: str = Header(..., alias="Authorization"),
+):
+    """Obtain a CSRF token for organization switch.
+
+    Returns a single-use token bound to the current session and target organization.
+    Token expires after 5 minutes.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    session_id = authorization[7:]
+
+    token = csrf_manager.generate(session_id, target_org_id)
+    return {"csrf_token": token, "expires_in": 300}
+
+
+@router.post("/embedded/console/session")
+async def create_embedded_console_session(
+    authorization: str = Header(..., alias="Authorization"),
+    workspace_id: Optional[str] = None,
+    tenant: Optional[str] = None,
+):
+    """Create an embedded admin console session.
+
+    Validates JWT token with strict audience, issuer, tenant, and expiration checks.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    token = authorization[7:]  # Strip "Bearer " prefix
+
+    try:
+        session = create_embedded_session(token)
+        return {
+            "session_id": session["session_id"],
+            "workspace_id": session["workspace_id"],
+            "tenant": session["tenant"],
+            "expires_at": session["expires_at"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+@router.post("/admin/embedded/config")
+async def configure_embedded_session_validation(
+    audience: str,
+    issuer: str,
+    tenants: Optional[str] = None,
+    secret: Optional[str] = None,
+    max_ttl: Optional[int] = None,
+    admin_token: str = Header(..., alias="X-Admin-Token"),
+):
+    """Configure embedded session validation (admin only)."""
+    if admin_token != "admin-secret-token":
+        raise HTTPException(status_code=403, detail="Admin token required")
+
+    tenant_set = set(tenants.split(",")) if tenants else set()
+    configure_embedded_sessions(
+        audience=audience,
+        issuer=issuer,
+        tenants=tenant_set,
+        secret=secret,
+        max_ttl=max_ttl,
+    )
+
+    return {"status": "configured"}
+
+
+# === Service Account Endpoints ===
+
+@router.post("/service-accounts")
+async def create_service_account(
+    name: str,
+    external_id: str,
+    organization_id: str,
+    metadata: Optional[Dict] = None,
+):
+    """Create a service account with unique external ID validation."""
+    try:
+        account = service_account_registry.create(name, external_id, organization_id, metadata)
+        return {
+            "account_id": account.account_id,
+            "name": account.name,
+            "external_id": account.external_id,
+            "organization_id": account.organization_id,
+            "status": account.status.value,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.get("/service-accounts/{account_id}")
+async def get_service_account(account_id: str):
+    account = service_account_registry.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Service account not found")
+    return {
+        "account_id": account.account_id,
+        "name": account.name,
+        "external_id": account.external_id,
+        "organization_id": account.organization_id,
+        "status": account.status.value,
+        "metadata": account.metadata,
+    }
+
+
+@router.put("/service-accounts/{account_id}")
+async def update_service_account(
+    account_id: str,
+    name: Optional[str] = None,
+    external_id: Optional[str] = None,
+    metadata: Optional[Dict] = None,
+):
+    """Update a service account. External ID changes are validated for uniqueness."""
+    try:
+        account = service_account_registry.update(account_id, name, external_id, metadata)
+        return {
+            "account_id": account.account_id,
+            "name": account.name,
+            "external_id": account.external_id,
+            "organization_id": account.organization_id,
+            "status": account.status.value,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=409 if "already in use" in str(e) else 400, detail=str(e))
+
+
+@router.post("/service-accounts/{account_id}/disable")
+async def disable_service_account(account_id: str):
+    """Disable a service account. Its external ID becomes available for reuse."""
+    try:
+        account = service_account_registry.disable(account_id)
+        return {"account_id": account.account_id, "status": account.status.value}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/service-accounts/{account_id}/restore")
+async def restore_service_account(account_id: str):
+    """Restore a disabled service account. External ID must be unique among active accounts."""
+    try:
+        account = service_account_registry.restore(account_id)
+        return {"account_id": account.account_id, "status": account.status.value}
+    except ValueError as e:
+        raise HTTPException(status_code=409 if "already in use" in str(e) else 404, detail=str(e))
+
+
+@router.get("/organizations/{org_id}/service-accounts")
+async def list_service_accounts(org_id: str, status: Optional[str] = None):
+    status_filter = ServiceAccountStatus(status) if status else None
+    accounts = service_account_registry.list_by_org(org_id, status_filter)
+    return {
+        "accounts": [
+            {
+                "account_id": a.account_id,
+                "name": a.name,
+                "external_id": a.external_id,
+                "status": a.status.value,
+            }
+            for a in accounts
+        ]
+    }
+
+
+@router.get("/organizations/{org_id}/service-accounts/duplicates")
+async def find_duplicate_external_ids(org_id: str):
+    """Find existing duplicate external IDs for migration purposes."""
+    duplicates = service_account_registry.get_existing_duplicates(org_id)
+    return {"organization_id": org_id, "duplicates": duplicates}
