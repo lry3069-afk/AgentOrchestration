@@ -16,13 +16,54 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class DuplicateExternalIdError(Exception):
+    """Raised when a service account external ID is already in use."""
+    pass
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._external_ids: Dict[str, str] = {}  # external_id -> agent_id mapping
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def _check_external_id_unique(self, external_id: str, organization: Optional[str] = None) -> None:
+        """Validate that an external ID is unique among active service accounts.
+
+        Disabled (TERMINATED/STOPPED) accounts may reuse external IDs after
+        a 30-day cooldown period since their last update.
+        """
+        if external_id in self._external_ids:
+            existing_agent_id = self._external_ids[external_id]
+            existing = self._agents.get(existing_agent_id)
+            if existing:
+                status = existing.get("status", "")
+                if status not in (AgentStatus.TERMINATED.value, AgentStatus.STOPPED.value):
+                    raise DuplicateExternalIdError(
+                        f"External ID {external_id!r} is already in use "
+                        f"by an active service account ({existing_agent_id})"
+                    )
+                # Allow reuse if disabled for more than 30 days
+                updated_at = existing.get("updated_at", 0)
+                if time.time() - updated_at < 30 * 86400:
+                    raise DuplicateExternalIdError(
+                        f"External ID {external_id!r} was recently used. "
+                        f"Must wait 30 days after deactivation before reuse."
+                    )
+                # Clean up old mapping
+                del self._external_ids[external_id]
+
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+        external_id: Optional[str] = None
+    ) -> str:
+        if external_id:
+            self._check_external_id_unique(external_id)
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -31,11 +72,16 @@ class AgentRegistry:
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
             "config": config or {},
+            "external_id": external_id,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
+
+        if external_id:
+            self._external_ids[external_id] = agent_id
+
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
@@ -65,6 +111,9 @@ class AgentRegistry:
         if agent_id not in self._agents:
             return False
         agent = self._agents.pop(agent_id)
+        # Clean up external ID mapping
+        if agent.get("external_id"):
+            self._external_ids.pop(agent["external_id"], None)
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
@@ -73,110 +122,9 @@ class AgentRegistry:
     def count(self) -> int:
         return len(self._agents)
 
-# 2019-01-29T11:24:49 update
-
-# 2019-04-09T13:38:38 update
-
-# 2019-04-11T11:24:12 update
-
-# 2019-06-26T17:03:48 update
-
-# 2019-07-03T14:55:48 update
-
-# 2019-07-18T18:18:47 update
-
-# 2019-11-05T11:27:19 update
-
-# 2019-11-20T11:35:05 update
-
-# 2019-11-23T15:28:54 update
-
-# 2020-03-13T09:23:07 update
-
-# 2020-03-30T19:31:18 update
-
-# 2020-04-22T15:03:30 update
-
-# 2020-07-21T10:00:48 update
-
-# 2020-09-10T09:02:08 update
-
-# 2020-09-10T13:39:12 update
-
-# 2020-09-22T16:27:52 update
-
-# 2020-10-15T10:33:14 update
-
-# 2021-05-13T11:15:56 update
-
-# 2021-07-07T14:57:13 update
-
-# 2021-07-13T15:15:19 update
-
-# 2021-07-27T10:18:16 update
-
-# 2022-03-11T15:24:11 update
-
-# 2022-09-22T13:24:20 update
-
-# 2022-11-01T12:20:40 update
-
-# 2023-01-30T12:32:27 update
-
-# 2023-03-10T09:43:50 update
-
-# 2023-05-10T14:28:01 update
-
-# 2023-05-11T20:04:46 update
-
-# 2023-05-30T17:00:59 update
-
-# 2023-07-13T17:54:32 update
-
-# 2023-07-20T19:04:20 update
-
-# 2023-07-31T17:00:02 update
-
-# 2023-09-05T19:42:07 update
-
-# 2024-01-02T10:29:47 update
-
-# 2024-09-17T12:45:29 update
-
-# 2024-09-17T11:51:01 update
-
-# 2024-11-06T18:20:15 update
-
-# 2025-01-12T15:13:14 update
-
-# 2025-01-14T20:24:39 update
-
-# 2025-03-26T20:21:27 update
-
-# 2025-04-10T18:27:06 update
-
-# 2025-06-19T20:34:58 update
-
-# 2025-06-21T20:23:53 update
-
-# 2025-06-24T20:30:30 update
-
-# 2025-07-03T13:28:03 update
-
-# 2025-07-24T17:42:21 update
-
-# 2025-08-19T17:42:23 update
-
-# 2025-08-21T11:06:52 update
-
-# 2025-10-24T09:10:08 update
-
-# 2025-12-18T19:34:38 update
-
-# 2026-02-06T11:22:22 update
-
-# 2026-02-13T15:42:04 update
-
-# 2026-04-10T08:16:30 update
-
-# 2026-04-29T18:16:11 update
+    def find_by_external_id(self, external_id: str) -> Optional[Dict[str, Any]]:
+        """Look up an agent by its external service account ID."""
+        agent_id = self._external_ids.get(external_id)
+        if agent_id:
+            return self._agents.get(agent_id)
+        return None
