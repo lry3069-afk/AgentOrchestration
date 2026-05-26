@@ -41,7 +41,12 @@ class TaskScheduler:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        # Only set retries=0 for brand-new tasks; preserve retries on re-enqueue (fail/retry path)
+        if "retries" not in task:
+            task["retries"] = 0
+        # Correlation ID: generate if not already present (preserved through retries)
+        if "request_id" not in task:
+            task["request_id"] = str(uuid4())
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
@@ -72,14 +77,42 @@ class TaskScheduler:
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
 
+    def get_dead_lettered(self) -> list[Dict]:
+        """Return all dead-lettered tasks, preserving request_id for audit correlation."""
+        if "_dead_letter" not in self._queues:
+            return []
+        dl = self._queues["_dead_letter"]
+        result = []
+        while len(dl) > 0:
+            result.append(dl.pop())
+        return result
+
     def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
-        return False
+        task = self._in_flight.get(task_id)
+        if task is None:
+            return False
+        task["retries"] += 1
+        if task["retries"] < self._max_retries:
+            self._in_flight.pop(task_id)
+            self.enqueue(task, queue, priority=task.get("priority", 0))
+            return True
+        else:
+            # Exceeded retries — move directly to dead-letter, preserving request_id
+            self._in_flight.pop(task_id)
+            self.dead_letter(task)
+            return False
+
+    def dead_letter(self, task: Dict) -> None:
+        """Move a task to the dead-letter queue, preserving its request_id and removing from in_flight."""
+        self._in_flight.pop(task["id"], None)  # ensure not stranded in in_flight
+        if "_dead_letter" not in self._queues:
+            self._queues["_dead_letter"] = PriorityQueue()
+        task["dead_lettered_at"] = time.time()
+        self._queues["_dead_letter"].push(task, priority=task.get("priority", 0))
+
+    def enqueue_batch(self, tasks: list[Dict], queue: str = "default", priority: int = 0) -> list[str]:
+        """Enqueue multiple tasks, each carrying its own request_id (generated or pre-set)."""
+        return [self.enqueue(task, queue, priority) for task in tasks]
 
 # 2019-04-25T08:37:12 update
 
