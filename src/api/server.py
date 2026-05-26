@@ -3,12 +3,19 @@
 import os
 from typing import Dict
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 
 from .routes import router
 from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
+from src.common.auth import (
+    AnonymousAccessError,
+    StaleCredentialError,
+    RevokedCredentialError,
+    InsufficientMembershipError,
+)
 
 
 def create_app(config: Dict = None) -> FastAPI:
@@ -33,6 +40,23 @@ def create_app(config: Dict = None) -> FastAPI:
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RateLimitMiddleware)
     app.add_middleware(LoggingMiddleware)
+
+    # Collaboration auth exception handlers — catch errors raised inside Depends.
+    @app.exception_handler(AnonymousAccessError)
+    async def _handle_anonymous(request: Request, exc: AnonymousAccessError):
+        return JSONResponse(status_code=401, content={"error": "Authentication required"})
+
+    @app.exception_handler(StaleCredentialError)
+    async def _handle_stale(request: Request, exc: StaleCredentialError):
+        return JSONResponse(status_code=401, content={"error": "Credential expired", "detail": str(exc)})
+
+    @app.exception_handler(RevokedCredentialError)
+    async def _handle_revoked(request: Request, exc: RevokedCredentialError):
+        return JSONResponse(status_code=403, content={"error": "Credential revoked", "detail": str(exc)})
+
+    @app.exception_handler(InsufficientMembershipError)
+    async def _handle_insufficient(request: Request, exc: InsufficientMembershipError):
+        return JSONResponse(status_code=403, content={"error": "Insufficient permissions", "detail": str(exc)})
 
     app.include_router(router, prefix="/api/v2")
 

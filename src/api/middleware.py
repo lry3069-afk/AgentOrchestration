@@ -1,21 +1,122 @@
 """API middleware components."""
 
-import time
 import logging
-from typing import Callable
+import time
+from typing import Callable, Optional
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+
+from src.common.auth import (
+    CollaborationAuthService,
+    Principal,
+    parse_bearer_token,
+    parse_session_cookie,
+    CollaborationAuthError,
+    AnonymousAccessError,
+    StaleCredentialError,
+    RevokedCredentialError,
+    InsufficientMembershipError,
+)
 
 logger = logging.getLogger(__name__)
 
+# Shared permission service (singleton for the process).
+_auth_service = CollaborationAuthService()
+
+
+# FastAPI dependency — inject into route handlers that need membership checks.
+def get_auth_service() -> CollaborationAuthService:
+    return _auth_service
+
+
+def get_principal(request: Request) -> Optional[Principal]:
+    """Retrieve the workspace-scoped principal attached by AuthMiddleware."""
+    return getattr(request.state, "principal", None)
+
+
+def require_membership(
+    request: Request,
+    min_role: str = "viewer",
+) -> Principal:
+    """FastAPI dependency: reject anonymous / stale / revoked / unprivileged callers.
+
+    Usage::
+
+        @router.post("/views/{view_id}/share")
+        async def share_view(
+            view_id: str,
+            principal: Principal = Depends(require_membership),
+        ):
+            ...
+    """
+    principal = get_principal(request)
+    return _auth_service.enforce_membership(principal, min_role=min_role)
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
+    """Middleware that validates credentials and enforces workspace scoping.
+
+    The middleware:
+    - Extracts credentials from Bearer tokens (API) and session cookies (browser).
+    - Attaches a workspace-scoped ``Principal`` to ``request.state.principal``.
+    - Returns 401/403 for anonymous, stale, or revoked credentials.
+    - Leaves fine-grained role enforcement to the ``require_membership`` dependency.
+    """
+
+    PUBLIC_PATHS = frozenset({
+        "/api/v2/auth/token",
+        "/health",
+        "/api/docs",
+        "/api/redoc",
+        "/api/v2/openapi.json",
+    })
+
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+        # Skip auth for public endpoints.
+        if request.url.path in self.PUBLIC_PATHS or not request.url.path.startswith("/api/v2"):
+            return await call_next(request)
+
+        principal: Optional[Principal] = None
+
+        # 1. Bearer token (API clients).
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            principal = parse_bearer_token(token)
+
+        # 2. Session cookie (browser clients).
+        if principal is None:
+            cookie = request.cookies.get("ao_session")
+            if cookie:
+                principal = parse_session_cookie(cookie)
+
+        # 3. Validate and attach.
+        try:
+            principal = _auth_service.enforce_membership(principal)
+        except AnonymousAccessError:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Authentication required"},
+            )
+        except StaleCredentialError as exc:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Credential expired", "detail": str(exc)},
+            )
+        except RevokedCredentialError as exc:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Credential revoked", "detail": str(exc)},
+            )
+        except InsufficientMembershipError as exc:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Insufficient permissions", "detail": str(exc)},
+            )
+
+        request.state.principal = principal
         return await call_next(request)
 
 

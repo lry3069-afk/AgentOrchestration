@@ -1,12 +1,22 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
+from functools import partial
+
+from fastapi import APIRouter, HTTPException, Depends, Request
 from typing import List, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.auth import Principal, CollaborationAuthService
+from src.api.middleware import require_membership, get_auth_service, get_principal
 
 router = APIRouter()
 registry = AgentRegistry()
+
+# ---------------------------------------------------------------------------
+# In-memory saved-view store (simulates the collaboration feature)
+# ---------------------------------------------------------------------------
+_views: Dict[str, Dict] = {}
+_view_shares: Dict[str, List[str]] = {}  # view_id -> [workspace_id, ...]
 
 
 @router.get("/agents")
@@ -53,6 +63,100 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+# ---------------------------------------------------------------------------
+# Saved-view sharing (collaboration auth — Issue #4687)
+# ---------------------------------------------------------------------------
+
+@router.post("/views")
+async def create_view(
+    request: Request,
+    principal: Principal = Depends(require_membership),
+):
+    """Create a saved view scoped to the caller's workspace.
+
+    The workspace is enforced by ``require_membership`` — stale, revoked,
+    anonymous, and insufficiently-scoped principals are rejected before
+    this handler executes.
+    """
+    body = await request.json()
+    name = body.get("name", "Untitled")
+    query = body.get("query", {})
+
+    view_id = f"view-{principal.workspace_id}-{len(_views) + 1}"
+    _views[view_id] = {
+        "id": view_id,
+        "name": name,
+        "query": query,
+        "workspace_id": principal.workspace_id,
+        "created_by": principal.user_id,
+    }
+    _view_shares[view_id] = [principal.workspace_id]
+    return {"view_id": view_id, "status": "created"}
+
+
+@router.post("/views/{view_id}/share")
+async def share_view(
+    view_id: str,
+    request: Request,
+    principal: Principal = Depends(partial(require_membership, min_role="editor")),
+):
+    """Share a saved view with another workspace.
+
+    Only ``editor`` or ``owner`` can share.  The handler enforces that
+    the view belongs to the caller's own workspace before sharing.
+    """
+    body = await request.json()
+    target_workspace = body.get("target_workspace", "")
+    if not target_workspace:
+        raise HTTPException(status_code=400, detail="target_workspace is required")
+    view = _views.get(view_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="View not found")
+
+    # Enforce: view must belong to the caller's workspace.
+    if view["workspace_id"] != principal.workspace_id:
+        raise HTTPException(status_code=403, detail="Cannot share a view from another workspace")
+
+    if view_id not in _view_shares:
+        _view_shares[view_id] = [principal.workspace_id]
+
+    if target_workspace not in _view_shares[view_id]:
+        _view_shares[view_id].append(target_workspace)
+
+    return {"view_id": view_id, "shared_with": _view_shares[view_id]}
+
+
+@router.get("/views/{view_id}")
+async def get_view(
+    view_id: str,
+    principal: Principal = Depends(require_membership),
+):
+    """Retrieve a saved view — only if shared with the caller's workspace."""
+    view = _views.get(view_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="View not found")
+
+    shares = _view_shares.get(view_id, [])
+    if principal.workspace_id not in shares:
+        raise HTTPException(status_code=403, detail="View not shared with your workspace")
+
+    return view
+
+
+@router.get("/views")
+async def list_views(
+    principal: Principal = Depends(require_membership),
+):
+    """List all views shared with the caller's workspace."""
+    result = []
+    for vid, view in _views.items():
+        shares = _view_shares.get(vid, [])
+        if principal.workspace_id in shares:
+            result.append(view)
+    return {"views": result}
+
 
 # 2019-03-18T11:10:18 update
 
