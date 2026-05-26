@@ -1,10 +1,36 @@
-"""Task Scheduler — Priority-based task queuing and dispatch."""
+"""Task Scheduler — Priority-based task queuing and dispatch with fairness budgets."""
 
 import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+import logging
+from typing import Any, Dict, Optional, List, Set
 from uuid import uuid4
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+
+class PriorityClass(Enum):
+    """Priority classes for fairness budget separation."""
+    URGENT = "urgent"
+    HIGH = "high"
+    NORMAL = "normal"
+    LOW = "low"
+    BACKGROUND = "background"
+
+
+class FairnessBudgetExceededError(Exception):
+    """Raised when a priority class has exhausted its fairness budget."""
+
+    def __init__(self, priority_class: PriorityClass, budget: int, used: int):
+        super().__init__(
+            f"Fairness budget for {priority_class.value} exceeded "
+            f"(budget={budget}, used={used})"
+        )
+        self.priority_class = priority_class
+        self.budget = budget
+        self.used = used
 
 
 class PriorityQueue:
@@ -30,187 +56,270 @@ class PriorityQueue:
         return len(self._queue)
 
 
+class FairnessBudget:
+    """Tracks usage of fairness budget per priority class.
+
+    Each priority class gets a separate budget (e.g., number of tasks
+    that can be dispatched in a time window).  Once the budget is
+    exhausted, tasks of that class are deferred until the budget
+    resets.
+    """
+
+    def __init__(
+        self,
+        budgets: Dict[PriorityClass, int],
+        window_seconds: int = 60,
+    ):
+        self._budgets = budgets
+        self._window = window_seconds
+        # Maps priority_class -> list of (timestamp, task_id)
+        self._usage: Dict[PriorityClass, List[float]] = {
+            pc: [] for pc in PriorityClass
+        }
+        self._lock = asyncio.Lock()
+
+    async def can_dispatch(
+        self,
+        priority_class: PriorityClass,
+        task_id: str,
+    ) -> bool:
+        """Check if a task of given priority class can be dispatched.
+
+        Returns True if budget is available, False otherwise.
+        """
+        async with self._lock:
+            now = time.time()
+            # Clean up old usage records
+            cutoff = now - self._window
+            self._usage[priority_class] = [
+                ts for ts in self._usage[priority_class] if ts > cutoff
+            ]
+            budget = self._budgets.get(priority_class, 0)
+            if budget <= 0:
+                # Unlimited budget
+                return True
+            if len(self._usage[priority_class]) >= budget:
+                logger.debug(
+                    "Fairness budget exhausted for %s (budget=%d, used=%d)",
+                    priority_class.value,
+                    budget,
+                    len(self._usage[priority_class]),
+                )
+                return False
+            self._usage[priority_class].append(now)
+            return True
+
+    def reset(self, priority_class: Optional[PriorityClass] = None):
+        """Reset usage for a priority class (or all)."""
+        with self._lock:
+            if priority_class is None:
+                for pc in self._usage:
+                    self._usage[pc].clear()
+            else:
+                self._usage[priority_class].clear()
+
+
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        fairness_budgets: Optional[Dict[PriorityClass, int]] = None,
+        fairness_window: int = 60,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+        # Fairness budget tracking
+        if fairness_budgets is None:
+            fairness_budgets = {
+                PriorityClass.URGENT: 10,
+                PriorityClass.HIGH: 20,
+                PriorityClass.NORMAL: 50,
+                PriorityClass.LOW: 100,
+                PriorityClass.BACKGROUND: 200,
+            }
+        self._fairness = FairnessBudget(fairness_budgets, fairness_window)
+
+        # Audit log for fairness decisions
+        self._audit_log: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Enqueue / schedule with fairness budget check
+    # ------------------------------------------------------------------
+
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+        priority_class: PriorityClass = PriorityClass.NORMAL,
+    ) -> str:
+        """Enqueue a task with a priority class for fairness budgeting."""
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
         task["retries"] = 0
+        task["priority_class"] = priority_class.value
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+        priority_class: PriorityClass = PriorityClass.NORMAL,
+    ) -> str:
+        """Schedule a task for future execution with fairness class."""
         task_id = str(uuid4())
         task["id"] = task_id
+        task["priority_class"] = priority_class.value
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        """Dequeue a task, respecting fairness budgets per priority class.
+
+        If the next task's priority class has exhausted its fairness
+        budget, the task is skipped (remains in queue) and the next
+        eligible task is returned.  If no eligible tasks are found,
+        returns None.
+        """
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
             task = self._scheduled.pop(tid)
             if task:
-                self.enqueue(task, queue)
+                self.enqueue(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                    priority_class=PriorityClass(
+                        task.get("priority_class", "normal")
+                    ),
+                )
 
-        if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
-                self._in_flight[task["id"]] = task
-                return task
-        return None
+        if queue not in self._queues or len(self._queues[queue]) == 0:
+            return None
+
+        # Peek at the highest-priority task
+        peeked = self._queues[queue].peek()
+        if peeked is None:
+            return None
+
+        # Determine its priority class
+        pc_str = peeked.get("priority_class", "normal")
+        try:
+            pc = PriorityClass(pc_str)
+        except ValueError:
+            pc = PriorityClass.NORMAL
+
+        # Check fairness budget
+        can_dispatch = await self._fairness.can_dispatch(pc, peeked["id"])
+        if not can_dispatch:
+            # Budget exhausted — skip this task and try the next one
+            # (We'll temporarily pop it, record the skip, and re-queue it
+            #  at the same priority but with a bumped counter to avoid
+            #  starvation.)
+            skipped = self._queues[queue].pop()
+            if skipped:
+                # Record the skip for audit
+                self._audit_log.append({
+                    "timestamp": now,
+                    "task_id": skipped["id"],
+                    "priority_class": pc.value,
+                    "action": "skipped_fairness_budget",
+                    "queue": queue,
+                })
+                # Re-queue with same priority but slightly lower
+                # to allow other tasks a chance
+                self._queues[queue].push(skipped, skipped.get("priority", 0) - 1)
+                logger.debug(
+                    "Task %s (priority_class=%s) skipped due to fairness budget",
+                    skipped["id"],
+                    pc.value,
+                )
+            # Recursively try the next task
+            return await self.dequeue(queue, timeout)
+
+        # Budget available — dequeue normally
+        task = self._queues[queue].pop()
+        if task:
+            self._in_flight[task["id"]] = task
+            self._audit_log.append({
+                "timestamp": now,
+                "task_id": task["id"],
+                "priority_class": pc.value,
+                "action": "dispatched",
+                "queue": queue,
+            })
+        return task
+
+    # ------------------------------------------------------------------
+    # Completion / failure
+    # ------------------------------------------------------------------
 
     def complete(self, task_id: str) -> bool:
         return self._in_flight.pop(task_id, None) is not None
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        priority_class: PriorityClass = PriorityClass.NORMAL,
+    ) -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self.enqueue(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                    priority_class=priority_class,
+                )
                 return True
         return False
 
-# 2019-04-25T08:37:12 update
-
-# 2019-06-04T16:40:00 update
-
-# 2019-07-11T12:01:28 update
-
-# 2019-08-02T12:20:21 update
-
-# 2019-08-23T10:38:50 update
-
-# 2019-10-31T13:55:52 update
-
-# 2019-11-04T20:12:32 update
-
-# 2019-12-13T12:22:36 update
-
-# 2020-02-01T10:32:37 update
-
-# 2020-02-26T09:44:38 update
-
-# 2020-03-09T19:00:55 update
-
-# 2020-05-01T18:40:34 update
-
-# 2020-05-12T15:10:31 update
-
-# 2020-06-30T13:24:19 update
-
-# 2020-09-22T16:00:45 update
-
-# 2020-10-20T10:52:48 update
-
-# 2020-10-21T12:18:08 update
-
-# 2020-11-06T12:35:01 update
-
-# 2020-12-09T08:09:33 update
-
-# 2021-01-07T08:20:36 update
-
-# 2021-10-02T15:23:16 update
-
-# 2021-10-06T16:14:57 update
-
-# 2021-10-06T09:27:41 update
-
-# 2021-11-19T08:37:40 update
-
-# 2022-03-01T16:39:54 update
-
-# 2022-05-26T13:43:07 update
-
-# 2022-06-02T10:50:58 update
-
-# 2022-06-14T10:46:48 update
-
-# 2022-07-31T16:44:34 update
-
-# 2022-08-30T18:20:12 update
-
-# 2022-11-04T14:47:03 update
-
-# 2022-12-06T10:36:49 update
-
-# 2022-12-22T13:21:12 update
-
-# 2022-12-26T12:24:50 update
-
-# 2023-03-09T08:09:55 update
-
-# 2023-05-01T10:07:37 update
-
-# 2023-06-08T14:32:15 update
-
-# 2023-07-14T17:24:18 update
-
-# 2023-12-14T08:38:31 update
-
-# 2024-02-20T13:43:58 update
-
-# 2024-03-24T08:52:42 update
-
-# 2024-03-28T15:27:17 update
-
-# 2024-03-29T18:10:33 update
-
-# 2024-04-15T20:18:31 update
-
-# 2024-05-27T13:11:52 update
-
-# 2024-05-27T16:42:56 update
-
-# 2024-06-20T13:03:45 update
-
-# 2024-06-28T12:32:58 update
-
-# 2024-07-10T14:10:16 update
-
-# 2024-07-26T14:18:59 update
-
-# 2024-08-12T08:21:05 update
-
-# 2024-08-21T16:58:40 update
-
-# 2024-09-27T19:54:30 update
-
-# 2024-10-21T13:47:42 update
-
-# 2024-11-11T09:19:27 update
-
-# 2024-12-24T08:23:41 update
-
-# 2025-02-14T10:35:15 update
-
-# 2025-03-31T18:09:40 update
-
-# 2025-06-21T17:32:49 update
-
-# 2025-07-21T16:52:28 update
-
-# 2025-08-20T19:45:16 update
-
-# 2025-11-04T18:54:24 update
-
-# 2025-12-09T20:17:36 update
-
-# 2026-01-12T15:42:32 update
-
-# 2026-01-23T14:41:20 update
-
-# 2026-03-18T14:43:07 update
-
-# 2026-04-13T11:43:19 update
+    # ------------------------------------------------------------------
+    # Fairness budget management
+    # ------------------------------------------------------------------
+
+    def reset_fairness_budget(self, priority_class: Optional[PriorityClass] = None):
+        """Reset fairness budget usage for a priority class (or all)."""
+        self._fairness.reset(priority_class)
+
+    def get_fairness_usage(self) -> Dict[str, Dict[str, int]]:
+        """Return current fairness budget usage per priority class."""
+        # This is a simplified view; the real FairnessBudget would expose
+        # internal counters.
+        return {
+            pc.value: {"budget": self._fairness._budgets.get(pc, 0)}
+            for pc in PriorityClass
+        }
+
+    def get_audit_log(
+        self,
+        limit: int = 100,
+        priority_class: Optional[PriorityClass] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve recent fairness audit log entries."""
+        filtered = self._audit_log
+        if priority_class is not None:
+            filtered = [
+                e for e in filtered
+                if e.get("priority_class") == priority_class.value
+            ]
+        return filtered[-limit:]
+
+# 2026-05-26T11:00:00 update — separate fairness budgets by priority class (#4604)
