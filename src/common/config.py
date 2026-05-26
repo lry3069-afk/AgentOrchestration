@@ -21,7 +21,25 @@ class Config:
         for key, value in os.environ.items():
             if key.startswith(prefix):
                 config_key = key[len(prefix):].lower().replace("_", ".")
-                self._set_nested(config_key, value)
+                # Convert string "true"/"false" to boolean
+                normalized_value = self._normalize_env_value(value)
+                self._set_nested(config_key, normalized_value)
+
+    def _normalize_env_value(self, value: str) -> Any:
+        """Convert environment string values to appropriate Python types."""
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+        # Try to parse as number if possible
+        try:
+            return int(value)
+        except ValueError:
+            try:
+                return float(value)
+            except ValueError:
+                pass
+        return value
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")

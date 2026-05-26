@@ -32,6 +32,41 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_env_override_boolean_true(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "true")
+        config = Config()
+        assert config.get("feature.enabled") is True
+
+    def test_env_override_boolean_false(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "false")
+        config = Config()
+        assert config.get("feature.enabled") is False
+
+    def test_env_override_boolean_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURE_ENABLED", "FALSE")
+        config = Config()
+        assert config.get("feature.enabled") is False
+
+    def test_env_override_integer(self, monkeypatch):
+        monkeypatch.setenv("AO_SERVER_PORT", "8080")
+        config = Config()
+        assert config.get("server.port") == 8080
+
+    def test_env_override_float(self, monkeypatch):
+        monkeypatch.setenv("AO_VERSION", "3.14")
+        config = Config()
+        assert config.get("version") == 3.14
+
+    def test_env_override_string_unchanged(self, monkeypatch):
+        monkeypatch.setenv("AO_SERVER_HOST", "localhost")
+        config = Config()
+        assert config.get("server.host") == "localhost"
+
+    def test_env_override_with_dots(self, monkeypatch):
+        monkeypatch.setenv("AO_DATABASE_URL", "postgres://localhost/db")
+        config = Config()
+        assert config.get("database.url") == "postgres://localhost/db"
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update
